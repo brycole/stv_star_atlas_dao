@@ -1,0 +1,411 @@
+// Fetch the vote data from the API
+function fetchVoteDataFromAPI() {
+  const url = 'https://galaxy.staratlas.com/proposals/votes/91652743-f916-4566-99af-421a557f7c3d.json';
+
+  const response = UrlFetchApp.fetch(url);
+  const jsonData = JSON.parse(response.getContentText());
+
+  const voteRecords = jsonData.map(record => ({
+    voteCount: parseFloat(record.votingPower),
+    voteOrder: record.voteResult.split(',')
+  }));
+
+  return voteRecords;
+}
+
+// Combine identical vote records with the same vote order
+function combineVoteRecords(voteRecords) {
+  const combinedRecords = [];
+
+  voteRecords.forEach(record => {
+    const existing = combinedRecords.find(r => arrayEqual(r.voteOrder, record.voteOrder));
+
+    if (existing) {
+      existing.voteCount += record.voteCount;
+    } else {
+      combinedRecords.push(record);
+    }
+  });
+
+  return combinedRecords;
+}
+
+function arrayEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+// Array to hold the log messages and timestamps
+const logData = [];
+
+// Function to log messages with GMT timestamp
+function logMessage(message) {
+  const now = new Date();
+  const gmtTimestamp = Utilities.formatDate(now, "GMT", "yyyy-MM-dd HH:mm:ss' GMT'");
+  logData.push([gmtTimestamp, message]); // Store both timestamp and message
+  Logger.log(message);
+}
+
+// Function to write all logs to the sheet at once
+function writeLogsToSheet() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('stv_logs');
+  const lastRow = sheet.getLastRow();
+  
+  // Append the logData to the sheet
+  sheet.getRange(lastRow + 1, 1, logData.length, 2).setValues(logData);
+
+  // Clear logData array after writing to the sheet
+  logData.length = 0;
+}
+
+// Function to clear the stv_logs sheet
+function clearLogSheet() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('stv_logs');
+  sheet.clearContents(); // Clear all the contents of the sheet
+}
+
+// Function to write final 5 winners to "results" sheet in B26-C30
+function writeResultsToSheet(winners) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('results');
+  
+  // Ensure only the first 5 winners are written to cells B26 to B30
+  for (let i = 0; i < Math.min(winners.length, 5); i++) {
+    sheet.getRange(28 + i, 2).setValue(winners[i]); // Write winners to C26-C30
+  }
+  
+  // Clear any remaining cells if fewer than 5 winners
+  if (winners.length < 5) {
+    for (let i = winners.length; i < 5; i++) {
+      sheet.getRange(28 + i, 2).clearContent(); // Clear content if fewer winners
+    }
+  }
+}
+
+function calculateQuota(totalVotes, seats) {
+  return totalVotes / seats;
+}
+
+function getNextHighestNonElectedNonEliminatedCandidate(candidateSet, electedCandidates, eliminatedCandidates) {
+  let highestCandidate = null;
+  let highestVotes = 0;
+
+  for (const candidate in candidateSet) {
+    if (!electedCandidates.includes(candidate) && !eliminatedCandidates.includes(candidate) && candidateSet[candidate] > highestVotes) {
+      highestVotes = candidateSet[candidate];
+      highestCandidate = candidate;
+    }
+  }
+
+  if (highestCandidate) {
+    logMessage(`Next highest non-elected, non-eliminated candidate for redirection: ${highestCandidate}`);
+  } else {
+    logMessage(`No valid non-elected, non-eliminated candidate found for redirection.`);
+  }
+
+  return highestCandidate;
+}
+
+function logNonElectedCandidateVotes(candidateVotes, electedCandidates, message = 'Non-Elected Candidate Votes') {
+  const nonElectedCandidateVotes = {};
+  for (const candidate in candidateVotes) {
+    if (!electedCandidates.includes(candidate)) {
+      nonElectedCandidateVotes[candidate] = candidateVotes[candidate];
+    }
+  }
+  logMessage(`${message}: ${JSON.stringify(nonElectedCandidateVotes, null, 2)}`);
+}
+
+function redistributeSurplus(candidate, candidateData, surplus, candidateSet, electedCandidates) {
+  logMessage(`Redistributing ${surplus} surplus votes from ${candidate}`);
+  logMessage(`Elected Candidates: ${JSON.stringify(electedCandidates)}`);
+
+  let totalTransferred = 0;
+  let totalExhausted = 0;
+
+  const totalVotesForRedistribution = candidateData.votes.reduce((acc, record) => acc + record.voteCount, 0);
+
+  candidateData.votes.forEach(record => {
+    const transferableVotes = (record.voteCount / totalVotesForRedistribution) * surplus;
+
+    let nextPreference = null;
+    for (let i = 1; i < record.voteOrder.length; i++) {
+      if (!electedCandidates.includes(record.voteOrder[i])) {
+        nextPreference = record.voteOrder[i];
+        break;
+      }
+    }
+
+    if (nextPreference && !electedCandidates.includes(nextPreference)) {
+      if (candidateSet[nextPreference]) {
+        candidateSet[nextPreference] += transferableVotes;
+      } else {
+        candidateSet[nextPreference] = transferableVotes;
+      }
+      logMessage(`Transferred ${transferableVotes} votes to ${nextPreference}`);
+      totalTransferred += transferableVotes;
+    } else {
+      logMessage(`No valid next preference for vote from ${candidate}. Would exhaust ${transferableVotes} votes.`);
+      const nextHighestCandidate = getNextHighestNonElectedCandidate(candidateSet, electedCandidates);
+      if (nextHighestCandidate) {
+        candidateSet[nextHighestCandidate] += transferableVotes;
+        logMessage(`Redirected ${transferableVotes} would-be exhausted votes to ${nextHighestCandidate}`);
+        totalExhausted += transferableVotes;
+      } else {
+        logMessage(`No non-elected candidate found for redirection. Exhausting ${transferableVotes} votes.`);
+      }
+    }
+  });
+
+  logMessage(`Total votes transferred: ${totalTransferred}`);
+  logMessage(`Surplus: ${surplus}`);
+  logMessage(`Difference between surplus and transferred: ${surplus - totalTransferred}`);
+  logMessage(`Total exhausted votes transferred: ${totalExhausted}`);
+}
+
+function eliminateLowestCandidate(candidateVotes, combinedVoteRecords, electedCandidates, eliminatedCandidates, quota) {
+  let lowestCandidate = null;
+  let lowestVotes = Infinity;
+
+  for (const candidate in candidateVotes) {
+    if (!electedCandidates.includes(candidate) && !eliminatedCandidates.includes(candidate) && candidateVotes[candidate] < lowestVotes) {
+      lowestVotes = candidateVotes[candidate];
+      lowestCandidate = candidate;
+    }
+  }
+
+  if (lowestCandidate === null) {
+    logMessage("No candidates to eliminate. All remaining candidates are elected.");
+    return;
+  }
+
+  logMessage(`Eliminating candidate: ${lowestCandidate} with ${lowestVotes} votes`);
+
+  const candidateData = {
+    totalVotes: candidateVotes[lowestCandidate],
+    votes: combinedVoteRecords.filter(record => record.voteOrder[0] === lowestCandidate)
+  };
+
+  eliminatedCandidates.push(lowestCandidate);
+
+  if (candidateData.votes.length === 0) {
+    logMessage(`No vote records found for ${lowestCandidate}. Transferring all ${lowestVotes} votes to the next non-eliminated candidate.`);
+    const nextHighestCandidate = getNextHighestNonElectedNonEliminatedCandidate(candidateVotes, electedCandidates, eliminatedCandidates);
+    if (nextHighestCandidate) {
+      candidateVotes[nextHighestCandidate] += lowestVotes;
+      logMessage(`Transferred ${lowestVotes} votes from ${lowestCandidate} to ${nextHighestCandidate}.`);
+    } else {
+      logMessage(`No valid non-elected, non-eliminated candidate found. Exhausting ${lowestVotes} votes.`);
+    }
+
+    delete candidateVotes[lowestCandidate];
+    return;
+  }
+
+  let totalTransferred = 0;
+  let totalExhausted = 0;
+
+  candidateData.votes.forEach(record => {
+    logMessage(`Processing vote record: ${JSON.stringify(record)}`);
+
+    let nextPreference = null;
+    for (let i = 1; i < record.voteOrder.length; i++) {
+      if (!electedCandidates.includes(record.voteOrder[i]) && !eliminatedCandidates.includes(record.voteOrder[i])) {
+        nextPreference = record.voteOrder[i];
+        logMessage(`Found next preference for ${lowestCandidate}: ${nextPreference}`);
+        break;
+      }
+    }
+
+    const transferableVotes = record.voteCount;
+
+    if (nextPreference) {
+      if (candidateVotes[nextPreference]) {
+        candidateVotes[nextPreference] += transferableVotes;
+      } else {
+        candidateVotes[nextPreference] = transferableVotes;
+      }
+      logMessage(`Transferred ${transferableVotes} votes from ${lowestCandidate} to ${nextPreference}`);
+      totalTransferred += transferableVotes;
+    } else {
+      logMessage(`No valid next preference for vote from ${lowestCandidate}. Would exhaust ${transferableVotes} votes.`);
+      const nextHighestCandidate = getNextHighestNonElectedNonEliminatedCandidate(candidateVotes, electedCandidates, eliminatedCandidates);
+      if (nextHighestCandidate) {
+        candidateVotes[nextHighestCandidate] += transferableVotes;
+        logMessage(`Redirected ${transferableVotes} would-be exhausted votes to ${nextHighestCandidate}`);
+        totalTransferred += transferableVotes;
+      } else {
+        logMessage(`No valid non-elected, non-eliminated candidate found. Exhausting ${transferableVotes} votes.`);
+        totalExhausted += transferableVotes;
+      }
+    }
+  });
+
+  const untransferredVotes = lowestVotes - (totalTransferred + totalExhausted);
+  if (untransferredVotes > 0) {
+    const nextHighestCandidate = getNextHighestNonElectedNonEliminatedCandidate(candidateVotes, electedCandidates, eliminatedCandidates);
+    if (nextHighestCandidate) {
+      candidateVotes[nextHighestCandidate] += untransferredVotes;
+      logMessage(`Redirected remaining ${untransferredVotes} votes from ${lowestCandidate} to ${nextHighestCandidate}`);
+    } else {
+      logMessage(`No valid non-elected, non-eliminated candidate found for remaining votes. Exhausting ${untransferredVotes} votes.`);
+      totalExhausted += untransferredVotes;
+    }
+  }
+
+  delete candidateVotes[lowestCandidate];
+
+  logMessage(`Total votes transferred from ${lowestCandidate}: ${totalTransferred}`);
+  logMessage(`Total exhausted votes: ${totalExhausted}`);
+  logMessage(`Difference between original votes and transferred + exhausted: ${lowestVotes - (totalTransferred + totalExhausted)}`);
+  logNonElectedCandidateVotes(candidateVotes, electedCandidates, 'Non-Elected Candidate Votes After Elimination');
+}
+
+// Function to find the next highest **non-elected** candidate
+function getNextHighestNonElectedCandidate(candidateSet, electedCandidates) {
+  let highestCandidate = null;
+  let highestVotes = 0;
+
+  // Find the candidate with the most votes who is not elected
+  for (const candidate in candidateSet) {
+    if (!electedCandidates.includes(candidate) && candidateSet[candidate] > highestVotes) {
+      highestVotes = candidateSet[candidate];
+      highestCandidate = candidate;
+    }
+  }
+
+  if (highestCandidate) {
+    logMessage(`Next highest non-elected candidate for redirection: ${highestCandidate}`);
+  } else {
+    logMessage(`No valid non-elected candidate found for redirection.`);
+  }
+
+  return highestCandidate;
+}
+
+
+function calculateStvWinners(voteRecords, seats) {
+  const combinedVoteRecords = combineVoteRecords(voteRecords);
+  const totalVotes = combinedVoteRecords.reduce((acc, { voteCount }) => acc + voteCount, 0);
+  const quota = calculateQuota(totalVotes, seats);
+  logMessage('Droop Quota (Minimum Votes Required): ' + quota);
+
+  const candidateVotes = {};
+  const eliminatedCandidates = [];
+
+  combinedVoteRecords.forEach(record => {
+    const firstPreference = record.voteOrder[0];
+    if (!candidateVotes[firstPreference]) {
+      candidateVotes[firstPreference] = 0;
+    }
+    candidateVotes[firstPreference] += record.voteCount;
+  });
+
+  logMessage('Initial Candidate Votes: ' + JSON.stringify(candidateVotes, null, 2));
+
+  const electedCandidates = [];
+
+  for (const candidate in candidateVotes) {
+    if (candidateVotes[candidate] >= quota) {
+      const surplus = candidateVotes[candidate] - quota;
+      if (!electedCandidates.includes(candidate)) {
+        electedCandidates.push(candidate);
+        logMessage(`Elected Candidate: ${candidate} with ${candidateVotes[candidate]} votes (Surplus: ${surplus})`);
+      }
+    }
+  }
+
+  for (const candidate in candidateVotes) {
+    if (candidateVotes[candidate] >= quota) {
+      const surplus = candidateVotes[candidate] - quota;
+
+      if (surplus > 0) {
+        const candidateData = {
+          totalVotes: candidateVotes[candidate],
+          votes: combinedVoteRecords.filter(record => record.voteOrder[0] === candidate)
+        };
+
+        redistributeSurplus(candidate, candidateData, surplus, candidateVotes, electedCandidates);
+        logNonElectedCandidateVotes(candidateVotes, electedCandidates, `Non-Elected Candidate Votes After Surplus Redistribution`);
+
+        for (const candidateAfterRedistribution in candidateVotes) {
+          if (candidateVotes[candidateAfterRedistribution] >= quota && !electedCandidates.includes(candidateAfterRedistribution)) {
+            const newSurplus = candidateVotes[candidateAfterRedistribution] - quota;
+            electedCandidates.push(candidateAfterRedistribution);
+            logMessage(`Newly Elected Candidate: ${candidateAfterRedistribution} with ${candidateVotes[candidateAfterRedistribution]} votes (Surplus: ${newSurplus})`);
+
+            if (newSurplus > 0) {
+              const newCandidateData = {
+                totalVotes: candidateVotes[candidateAfterRedistribution],
+                votes: combinedVoteRecords.filter(record => record.voteOrder[0] === candidateAfterRedistribution)
+              };
+
+              redistributeSurplus(candidateAfterRedistribution, newCandidateData, newSurplus, candidateVotes, electedCandidates);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  while (electedCandidates.length < seats) {
+    const remainingCandidates = Object.keys(candidateVotes).filter(candidate => !electedCandidates.includes(candidate));
+
+    if (remainingCandidates.length === 1) {
+      const lastCandidate = remainingCandidates[0];
+      electedCandidates.push(lastCandidate);
+      logMessage(`Automatically Elected Last Remaining Candidate: ${lastCandidate}`);
+      break;
+    }
+
+    eliminateLowestCandidate(candidateVotes, combinedVoteRecords, electedCandidates, eliminatedCandidates, quota);
+
+    for (const candidateAfterElimination in candidateVotes) {
+      if (candidateVotes[candidateAfterElimination] >= quota && !electedCandidates.includes(candidateAfterElimination)) {
+        const newSurplus = candidateVotes[candidateAfterElimination] - quota;
+        electedCandidates.push(candidateAfterElimination);
+        logMessage(`Newly Elected Candidate: ${candidateAfterElimination} with ${candidateVotes[candidateAfterElimination]} votes (Surplus: ${newSurplus})`);
+
+        if (newSurplus > 0) {
+          const newCandidateData = {
+            totalVotes: candidateVotes[candidateAfterElimination],
+            votes: combinedVoteRecords.filter(record => record.voteOrder[0] === candidateAfterElimination)
+          };
+
+          redistributeSurplus(candidateAfterElimination, newCandidateData, newSurplus, candidateVotes, electedCandidates);
+        }
+      }
+    }
+  }
+
+  const nonElectedCandidateVotes = {};
+  for (const candidate in candidateVotes) {
+    if (!electedCandidates.includes(candidate)) {
+      nonElectedCandidateVotes[candidate] = candidateVotes[candidate];
+    }
+  }
+
+  logNonElectedCandidateVotes(candidateVotes, electedCandidates, `Non-Elected Candidate Votes After Surplus Redistribution`);
+  logMessage('Elected Candidates: ' + JSON.stringify(electedCandidates, null, 2));
+
+  return electedCandidates;
+}
+
+function runElection() {
+  clearLogSheet(); // Clear the logs at the beginning of every new run
+
+  const voteRecords = fetchVoteDataFromAPI();
+  const seats = 5;
+
+  const winners = calculateStvWinners(voteRecords, seats);
+
+  logMessage('Final STV Winners: ' + JSON.stringify(winners, null, 2));
+
+  // Write all logs in one go.
+  writeLogsToSheet();
+
+  // Write the last 5 winners to the results sheet in C26-C30
+  writeResultsToSheet(winners);
+}
